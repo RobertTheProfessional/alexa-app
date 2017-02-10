@@ -315,6 +315,7 @@ alexa.app = function(name) {
   // pre/post hooks to be run on every request
   this.pre = function( /*request, response, type*/ ) {};
   this.post = function( /*request, response, type*/ ) {};
+  this.catch = function ( /*error, request, response*/) {};
 
   // a mapping of keywords to arrays of possible values, for expansion of sample utterances
   this.dictionary = {};
@@ -348,139 +349,73 @@ alexa.app = function(name) {
     self.sessionEndedFunc = func;
   };
   this.request = function(request_json) {
-    return new Promise(function(resolve, reject) {
-      var request = new alexa.request(request_json);
-      var response = new alexa.response(request.getSession());
+    var request = new alexa.request(request_json);
+    var response = new alexa.response(request.getSession());
 
-      // error handling when a request fails in any way
-      var handleError = function(e) {
-        if (typeof self.error == "function") {
-          self.error(e, request, response);
-        } else if (typeof e == "string" && self.messages[e]) {
-          if (!request.isAudioPlayer()) {
-            response.say(self.messages[e]);
-            response.send(e);
-          } else {
-            response.fail(self.messages[e]);
-          }
-        }
-        if (!response.resolved) {
-          if (e.message) {
-            response.fail("Unhandled exception: " + e.message + ".", e);
-          } else {
-            response.fail("Unhandled exception.", e);
-          }
-        }
-      };
-
-      // prevent callback handler (request resolution) from being called multiple times
-      var callbackHandlerCalled = false;
-      // sends the request or handles an error if an error is passed in to the callback
-      var callbackHandler = function(e) {
-        if (callbackHandlerCalled) {
-          console.warn("Response has already been sent");
-          return;
-        }
-        callbackHandlerCalled = true;
-
-        if (e) {
-          handleError(e);
+    var requestType = request.type();
+    var prePromise = Promise.resolve();
+    if (typeof self.pre == "function") {
+      prePromise = Promise.resolve(self.pre(request, response, requestType));
+    }
+    return prePromise.then(function() {
+      if ("IntentRequest" === requestType) {
+        var intent = request_json.request.intent.name;
+        if (typeof self.intents[intent] != "undefined" && typeof self.intents[intent]["function"] == "function") {
+          return Promise.resolve(self.intents[intent]["function"](request, response));
         } else {
-          response.send();
+          throw "NO_INTENT_FOUND";
         }
-      };
+      } else if ("LaunchRequest" === requestType) {
+        if (typeof self.launchFunc == "function") {
+          return Promise.resolve(self.launchFunc(request, response));
+        } else {
+          throw "NO_LAUNCH_FUNCTION";
+        }
+      } else if ("SessionEndedRequest" === requestType) {
+        if (typeof self.sessionEndedFunc == "function") {
+          return Promise.resolve(self.sessionEndedFunc(request, response));
+        }
+      } else if (request.isAudioPlayer()) {
+        var event = requestType.slice(12);
+        var eventHandlerObject = self.audioPlayerEventHandlers[event];
+        if (typeof eventHandlerObject != "undefined" && typeof eventHandlerObject["function"] == "function") {
+          return Promise.resolve(eventHandlerObject["function"](request, response));
+        }
+      } else {
+        throw "INVALID_REQUEST_TYPE";
+      }
+    }).then(function() {
+      var postPromise = Promise.resolve();
+      if (typeof self.post == "function") {
+        postPromise = Promise.resolve(self.post(request, response, requestType));
+      }
+      return postPromise;
+    }).then(function() {
+      response.prepare();
+      return response.response;
+    }).catch(function (e) {
+      // error handling when a request fails in any way
+      if (typeof self.error == "function") {
+        self.error(e, request, response);
+      }
 
-      var postExecuted = false;
-      // attach Promise resolve/reject functions to the response object
-      response.send = function(exception) {
-        response.prepare();
-        if (typeof self.post == "function" && !postExecuted) {
-          postExecuted = true;
-          self.post(request, response, requestType, exception);
-        }
-        if (!response.resolved) {
+      if (typeof self.catch == "function") {
+        return self.catch(e, request, response);
+      } else if (typeof e == "string" && self.messages[e]) {
+        if (!request.isAudioPlayer()) {
+          response.say(self.messages[e]);
           response.resolved = true;
-          resolve(response.response);
+          response.prepare();
+          return response.response;
+        } else {
+          throw self.messages[e];
         }
-      };
-      response.fail = function(msg, exception) {
-        response.prepare();
-        if (typeof self.post == "function" && !postExecuted) {
-          postExecuted = true;
-          self.post(request, response, requestType, exception);
+      } else {
+        if (e.message) {
+          throw "Unhandled exception: " + e.message + ".";
+        } else {
+          throw "Unhandled exception.";
         }
-        if (!response.resolved) {
-          response.resolved = true;
-          reject(msg);
-        }
-      };
-      try {
-        var requestType = request.type();
-        if (typeof self.pre == "function") {
-          self.pre(request, response, requestType);
-        }
-        if (!response.resolved) {
-          if ("IntentRequest" === requestType) {
-            var intent = request_json.request.intent.name;
-            if (typeof self.intents[intent] != "undefined" && typeof self.intents[intent]["function"] == "function") {
-              var intentResult = self.intents[intent]["function"](request, response, callbackHandler);
-              if (intentResult && intentResult.then) {
-                Promise.resolve(intentResult).asCallback(callbackHandler);
-              } else if (false !== intentResult) {
-                callbackHandler();
-              } else {
-                console.warn("NOTE: using `return false` for async intent requests is deprecated and will not work after the next major version");
-              }
-            } else {
-              throw "NO_INTENT_FOUND";
-            }
-          } else if ("LaunchRequest" === requestType) {
-            if (typeof self.launchFunc == "function") {
-              var launchResult = self.launchFunc(request, response, callbackHandler);
-              if (launchResult && launchResult.then) {
-                Promise.resolve(launchResult).asCallback(callbackHandler);
-              } else if (false !== launchResult) {
-                callbackHandler();
-              } else {
-                console.warn("NOTE: using `return false` for async launch requests is deprecated and will not work after the next major version");
-              }
-            } else {
-              throw "NO_LAUNCH_FUNCTION";
-            }
-          } else if ("SessionEndedRequest" === requestType) {
-            if (typeof self.sessionEndedFunc == "function") {
-              var sessionEndedResult = self.sessionEndedFunc(request, response, callbackHandler);
-              if (sessionEndedResult && sessionEndedResult.then) {
-                Promise.resolve(sessionEndedResult).asCallback(callbackHandler);
-              } else if (false !== sessionEndedResult) {
-                callbackHandler();
-              } else {
-                console.warn("NOTE: using `return false` for async session ended requests is deprecated and will not work after the next major version");
-              }
-            } else {
-              response.send();
-            }
-          } else if (request.isAudioPlayer()) {
-            var event = requestType.slice(12);
-            var eventHandlerObject = self.audioPlayerEventHandlers[event];
-            if (typeof eventHandlerObject != "undefined" && typeof eventHandlerObject["function"] == "function") {
-              var eventHandlerResult = eventHandlerObject["function"](request, response, callbackHandler);
-              if (eventHandlerObject && eventHandlerObject.then) {
-                Promise.resolve(eventHandlerResult).asCallback(callbackHandler);
-              } else if (false !== eventHandlerResult) {
-                callbackHandler();
-              } else {
-                console.warn("NOTE: using `return false` for async audio player requests is deprecated and will not work after the next major version");
-              }
-            } else {
-              response.send();
-            }
-          } else {
-            throw "INVALID_REQUEST_TYPE";
-          }
-        }
-      } catch (e) {
-        handleError(e);
       }
     });
   };
